@@ -1,220 +1,178 @@
 # CleanMARL — CPDRE 煤电直接互惠实验框架
 
-CleanMARL 是本仓库自研的轻量级多智能体强化学习实现:绕开 RLlib 训练循环,用 PyTorch 原生管理
-采样、GAE、PPO/HAPPO 更新、GRU actor/critic、集中 critic、日志与 checkpoint。它服务于煤电供应链
-**直接互惠(CPDRE)** 研究。
+CleanMARL 是本仓库自研的轻量级多智能体强化学习实现:绕开 RLlib,用 PyTorch 原生管理采样、GAE、
+PPO/HAPPO 更新、GRU actor、集中 critic、**回报归一化(ValueNorm)**、日志与 checkpoint。服务于煤电
+供应链 **直接互惠(CPDRE)** 研究。
 
-> **权威规格 = `model/0626.md`**(取代旧 0611)。环境与配置已按 0626 落地:煤价固定为 1、平台型
-> 季节、互惠效用 `η·μ·g` 进主模型、`g^C` 用基准产能公平基准、`g^U` 用剩余供给减少、`K=1.2·m·D̄`、
-> `γ=0.99`、`c_rep=1.70`。主线:1 煤企 + 3 电企(其中 U1 为互惠电企)。
+> **权威规格 = `model/0626.md`**(尤其 §4.9 实施修订记录,记录本框架相对正文的全部落地改动)。
 
 ---
 
 ## 1. 运行前提
 
-- **从仓库根目录运行**(`run_sweep.py` 会自动把仓库根加入 `sys.path`;`--config` 路径相对 `cleanmarl/` 解析,写 `configs/xxx.yaml` 即可)。
-- 需要装了 torch 的 Python 环境。**本机(RTX 4060)**:conda 环境 `marllib_4060`,解释器
-  `/home/ylj/miniconda3/envs/marllib_4060/bin/python`(换机器见仓库根 `CLAUDE.md`)。
-- 依赖:`torch / numpy / gym / pyyaml`(`ray` 仅因环境基类 import,训练不走 RLlib)。
-
-下文命令用 `python` 代指上面的解释器。有 GPU 用 `--device cuda`,没有用 `--device cpu`。
+- **从仓库根目录运行**(`run_sweep.py` 自动把仓库根加入 `sys.path`;`--config` 路径相对 `cleanmarl/` 解析,写 `configs/xxx.yaml` 即可)。
+- 依赖见仓库根 `requirements.txt`:`torch / numpy==1.24.3 / scipy / pandas / pyyaml`(cleanmarl 不走 RLlib,无需 ray/gym)。`pip install -r requirements.txt`(torch 按服务器 CUDA 选)。
+- 本机(RTX4060)解释器 `/home/ylj/miniconda3/envs/marllib_4060/bin/python`;换机器见根 `CLAUDE.md`。下文 `python` 代指它。有 GPU 用 `--device cuda`,否则 `--device cpu`。
 
 ---
 
-## 2. 实验总览:六个实验,逐级递进
+## 2. 实验总览
 
-| 实验 | 目的 | 组别 | run_sweep 预设 |
+| 实验 | 目的 | 组别 | 入口 |
 | :-- | :-- | :-- | :-- |
-| **实验一** | 环境可训练性 + 选主算法(无互惠) | A1–A6 | `--experiment exp1` ✅ |
-| **实验二** | 直接互惠主实验(**头条 B4 vs B2**) | B1–B4 | `--experiment exp2` ✅ |
-| **实验三** | 机制来源消融(**C7 防自导自演**) | C1–C7 | `--experiment exp3` ✅ |
-| 实验四 | 参数敏感性与稳健性 | 扫 K/ρ_max/σ_D/η/… | 手动覆盖参数(见 §6) |
-| 实验五 | 规模 m / 互惠范围 h / 竞争 ρ | — | 手动覆盖参数(见 §6) |
-| 实验六 | 真实数据外部回放验证 | 冻结策略回放 | 单独脚本(见 §6) |
+| **实验一** | 选主算法(无互惠) | A1–A6 | `--experiment exp1` |
+| **实验二** | 直接互惠主实验(头条 B4 vs B2 / B4 vs B5) | B1–**B5** | `--experiment exp2` |
+| **实验三** | 机制来源消融 | C1–C7 | `--experiment exp3` |
+| 稀缺压力 | K 调小看互惠条件价值 | B2/B3/B4 | `configs/happo_cpdre_K30.yaml` |
+| **非稳态** | 旺季时间/时长/幅度逐年随机(动态 vs 静态合同) | B1–B5 / C1–C7 | `configs/happo_cpdre_nonstat.yaml` |
 
-**强制顺序:实验一 → 实验二 → 实验三。** 实验一不过(学习型不稳定优于规则基线)就**不要**进实验二——
-否则会把"算法训练失败"误判成"互惠机制无效"。实验四/五/六是稳健性/边界/外部效度,主结论(exp1–3)定了再做。
-
-每个实验 = 一条 `run_sweep` 命令(跑完该实验所有组别 × 所有种子)+ 一条 `analyze` 命令(出表 + 配对检验)。
-结果落在 `logs/cleanmarl/{组}_{算法}_seed{种子}/`。
+**顺序:实验一 → 实验二 → 实验三**;非稳态在稳态主线确立后做(揭示动态互惠的条件价值)。
+零参数启动器在 `cleanmarl/_run_*.sh`(已设单线程确定性 + 多核并行),例:
+```bash
+bash cleanmarl/_run_exp2_seeded.sh   # 实验二 B1-B5 x 12种子, 确定性
+bash cleanmarl/_run_nonstat.sh       # 非稳态 B1-B5 x 12种子
+bash cleanmarl/_run_exp3.sh          # 实验三 C1-C7
+```
 
 ---
 
-## 3. 实验一:环境可训练性与算法选择
+## 3. 实验一:算法选择
 
 ```bash
 python cleanmarl/run_sweep.py --config configs/happo_cpdre.yaml --experiment exp1 --seeds 40,41,42,43,44
 python cleanmarl/analyze_experiments.py --experiment exp1
 ```
-
-- **A1/A2** 规则基线(固定 / 状态感知 base-stock,煤企固定季节排程 θ);**A3=IPPO、A4=MAPPO、
-  A5=HAPPO、A6=HAPPO+低扰动**,均无互惠(`mechanism_mode` 用 `b2`,煤企**学 θ**)。
-- **看什么**:`system_profit` 高、跨种子 `reward_std` 小、`shortage_rate` 低、训练稳定 → 定主算法
-  (通常 HAPPO)。
-- **退出标准**:学习型(A3–A6)要稳定优于规则基线(A1/A2)。否则先调环境/算法,别进实验二。
+- **A1/A2 = 派生式 base-stock 基线**(produce-to-forecast 煤企 θ + order-up-to 电企 ω;A1 无安全库存 / A2 含报童式安全库存,`z=Φ⁻¹(c_rep/(c_rep+h))`)。**不在评估集调参,无泄漏**。规则基线现以 **b2 执行**(煤企用动作里的派生 θ),与学习组共用同一需求与管线。
+- A3=IPPO、A4=MAPPO、**A5=HAPPO**、A6=HAPPO+低扰动。
+- **选法**:HAPPO 按**跨种子 reward_std 最小(最稳)**入选;它与 MAPPO 的利润差很小、在噪声内——选的是稳定性。
+- 退出标准:学习型在**利润**上稳超规则基线(强规则 A2 的安全库存使其缺货更低,诚实权衡)。
 
 ---
 
 ## 4. 实验二:直接互惠机制主实验(核心)
 
 ```bash
-python cleanmarl/run_sweep.py --config configs/happo_cpdre.yaml --experiment exp2 --seeds 40,41,42,43,44
-python cleanmarl/analyze_experiments.py --experiment exp2
+bash cleanmarl/_run_exp2_seeded.sh    # B1-B5 x 12种子(推荐: 确定性)
+python cleanmarl/analyze_experiments.py --experiment exp2   # 注: 用 episode 级检验, 见 §7 警示
+python seed_level_analysis.py          # 诚实的种子级配对检验(正式结论用这个)
 ```
 
-| 组 | 名称 | θ | λ₁ | 记忆 μ | 互惠奖励 ημg |
+| 组 | 名称 | θ | λ₁(对 U1)| 记忆 μ | ημg |
 | :-- | :-- | :-- | :-- | :-- | :-- |
-| B1 | 公平规则基准 | 季节排程 | ≡1 | 无 | 无 |
-| B2 | **非关系动态协调基准(头条对照)** | 学 | ≡1 | 无 | 无 |
-| B3 | 规则互惠 | 学 | 依 χ̂ 触发 | 无 | 无 |
+| B1 | 派生公平规则基准 | 派生 base-stock | ≡1 | 无 | 无 |
+| B2 | **非关系动态协调(头条对照)** | 学 | ≡1 | 无 | 无 |
+| B3 | 规则互惠 | 学 | 依压力 χ̂ 触发 w_high | 无 | 无 |
 | B4 | **关系专属动态直接互惠** | 学 | 学∈[1,λmax] | 用 | **有** |
+| **B5** | **双边静态长协**(对照真实电煤长协) | 学 | 静态:淡季 U1 囤煤 ω_high + 旺季 λ=w_high | 无 | 无 |
 
-- **头条对照 B4 vs B2**:B2 已是"会动态学 θ 的非关系协调者",所以 B4 相对它的改善**不能**归因为
-  "单纯会动态协调"。analyze 自动做 (seed, episode) 配对 **Wilcoxon + bootstrap CI**(B4 vs B2/B3/B1)。
-- **判读(spec 0626 §4.6.3)**:
-  - `B4 ≈ B2` → 关系互惠不优于非关系动态协调。
-  - `B4 > B2` **且** SR_N、公平 J 未恶化 → 关系专属互惠有价值(还需实验三 C7 坐实非奖励塑形)。
-  - 若 `B4` 只压低 SR_1 却抬高 SR_N → **不算**系统协调,只是对 U1 的优先权(表已并列 SR_1/SR_N 供审计)。
-- **算法稳健性补充**:可在 B4 机制下换 `--config configs/{ippo,mappo}_cpdre.yaml` 跑同组,检验结论不依赖单一算法。
+- **两个头条对照**:**B4 vs B2**(关系互惠相对一般动态协调的增量)、**B4 vs B5**(动态相对静态合同)。
+- **判读(spec §4.6.3 + 实测)**:稳态下系统利润 **B4≈B2≈B3≈B5(null)**——供给固定、再分配零和,互惠不增系统利润;但 **B3/B4 显著降低 U1 缺货 SR_1**(伙伴再分配,代价 SR_N 略升)。**头条指标应看伙伴供应可靠性 / 抗冲击鲁棒性,而非系统利润。**
+- 若 B4 只压 SR_1 却抬 SR_N → 是对 U1 的优先权而非系统协调(表已并列 SR_1/SR_N)。
 
 ---
 
-## 5. 实验三:机制来源消融(防"自导自演")
+## 5. 实验三:机制来源消融
 
 ```bash
-python cleanmarl/run_sweep.py --config configs/happo_cpdre.yaml --experiment exp3 --seeds 40,41,42,43,44
-python cleanmarl/analyze_experiments.py --experiment exp3
+bash cleanmarl/_run_exp3.sh
+python cleanmarl/analyze_experiments.py --experiment exp3   # + seed_level 检验
 ```
 
 | 组 | 消融 | 识别目的 |
 | :-- | :-- | :-- |
 | C1 | 完整 B4 | 基准 |
-| C2 | `g^U≡0` | 切断宽松期承购建信任 |
-| C3 | `λ₁≡1` | 紧张期专属权重是否必要 |
-| C4 | 冻结 μ | 信任是否真参与策略 |
-| C5 | 固定 θ=θ_base,仅 λ 变 | 仅配给互惠能否解释 B4(反证) |
-| C6 | 信任更新但不进观测 | 策略是否真用关系信息 |
-| **C7** | **η=0**(关互惠效用) | **改善是否非奖励塑形所致** |
+| C2 | `g^U≡0`(disable_g_u) | 切断承购建信任 |
+| C3 | `λ₁≡1`(fixed_lambda) | 动态保供权重是否必要 |
+| C4 | 冻结 μ(freeze_memory) | 信任是否参与策略 |
+| C5 | 冻结 θ(freeze_theta) | 仅配给能否解释 B4 |
+| C6 | 信任不进观测(no_recip_in_obs) | 是否真用关系信息 |
+| **C7** | **η=0**(no_recip_reward) | 改善是否非奖励塑形 |
 
-- **最关键的判读**:
-  - **C7(η=0)仍优于 B1/B2 且伴随紧张期前 G_t 提升** → 互惠有**结构性**协调价值、η 仅放大 → **强结论**,
-    评审无法以"你用奖励造互惠"反驳。
-  - C7 ≈ B1/B2、仅 η>0 时 B4 取胜 → 价值由关系动机**使能**,作诚实弱表述(因评价指标独立于奖励,仍非循环)。
-  - B4 明显优于 C5 且 SR 下降伴随 G_t 提升 → 改善走**产能路径**而非零和搬运。
-  - **关系专属性**由 C3(去专属权重)+ C6(去关系观测)联合识别(C7 单独只反证非奖励塑形)。
+- 稳态消融:**C5 冻结 θ 利润崩** → 系统价值压倒性来自**可学习产能路径 θ**;C7≈C1 且去 ememory 不损 → 价值非奖励塑形。
+- **判读指标在非稳态下换成 SR_1 / 稳健性**:看去掉哪个部件会让 B4 的"抗非稳态伙伴保护"像 B5 一样崩。
+- ⚠️ **C5 注意**:`freeze_theta` 用固定季节排程 θ_offpeak/θ_peak。该排程已由反向坏值 1.15/0.80 修正为 **0.95/1.20(旺季多产)**;旧 C5 结果作废,须用新排程重跑。
 
 ---
 
-## 6. 实验四/五/六(稳健性 / 边界 / 外部效度)
+## 6. 非稳态季节(动态 vs 静态合同 的关键检验)
 
-这三个在 `model/0626.md` §4.6.4–4.6.6 已完整设计,但 **`run_sweep` 暂未内置一键预设**,目前通过覆盖
-环境参数或单独脚本运行(后续可往 `run_sweep.EXPERIMENTS` 补条目)。
-
-- **实验四(参数敏感性)**:对 B4(及对照)扫 `K∈{1.0,1.2,1.5}mD̄`、`ρ_max∈{0.02,0.05,∞}`、
-  `W_on∈{18,26,34}`、`λ_max`、`α/δ`、`σ_D`、`c_rep`、`η/λ_S/λ_J`,逐维固定其余。重点验:`ρ_max→∞`
-  时跨期协调价值消失(惯性是机制前提);`η` 小时改善仍可由独立指标观测(与 C7 互补)。
-- **实验五(规模/范围/竞争)**:`m∈{2,3,5,7,9}`(单电企需求随 m 调整保压力比)、互惠范围
-  `h∈{1,…,⌊m/2⌋}`(煤企互惠项已按 `1/h` 平均,分离范围与奖励尺度)、需求相关性
-  `ρ∈{0,…,1}`(`demand_corr` / `demand_common_pool`)。
-- **实验六(真实数据回放)**:冻结 B1/B2/B3/B4 策略,在真实电力负荷 + 三档压力产能 `K_stress`
-  上平行回放,区分"学习型(B2)"与"动态互惠(B4)"改进。
-
-> 覆盖单个参数示例(单组单种子):
-> ```bash
-> python cleanmarl/run_sweep.py --config configs/happo_cpdre.yaml --group B4 --seeds 42 \
->   --env-override rho_max=0.02   # 若 run_sweep 暂不支持 --env-override,改对应 yaml 后再跑
-> ```
+```bash
+bash cleanmarl/_run_nonstat.sh                 # B1-B5 x 12种子, nonstationary_season=true
+python nonstat_cmp.py                           # 稳态 vs 非稳态 种子级对比
+```
+- 每年随机抽 `φ_D~U[6,22]`、`W_on~U[16,34]`、`a_D~U[0.30,0.55]`,仍 mean-preserving(年均=1)。
+- **关键不对称**:需求按真实随机季节走;**长协 B5 / 规则按名义日历(φ=13,W_on=26)提前签死**(对应真实长协月度量分解),真实季节偏离时静态合同错配;**B2/B4 凭实现需求 + 压力 χ̂ 适应**。双方均观测当下真实季节(现实合理),差距来源是"日历承诺合同 vs 逐周再优化",非信息不对称(spec §4.9.1)。
+- **实测核心发现**:稳态下 B5 与 B4 都能保住 U1;**非稳态下 B5 的 U1 保护显著崩溃(SR_1 0.010→0.036),而 B4 稳健不变(0.009)**,B4 vs B5 SR_1 差 p<0.001。→ **直接互惠的独特价值 = 不确定环境下对伙伴提供静态合同给不了的稳健供应保障。**
 
 ---
 
-## 7. 组别 → 环境机制映射(`run_sweep.GROUP_ENV_MAP`)
+## 7. 统计口径(★重要,易踩的坑)
+
+- **固定评估轨迹**:`env.eval_reset(idx)` 内部 `rng=default_rng(9000+idx)`,与训练种子无关 → 任何组别/种子都在同一批 64 条固定轨迹上评估,可配对。非稳态下该 idx 的随机季节也被钉死、各组一致。
+- **训练确定性**:`run_one` 调 `set_seed(seed)` 固定 torch+numpy → 同种子下各机制组**共享网络初始化**,机制差异被干净隔离、可复现(`OMP_NUM_THREADS=1` 时完全确定)。**未固定种子时 run 间噪声 ±13/种子,会淹没 ~6 的机制效应。**
+- **种子级 vs episode 级(关键)**:`analyze_experiments.py` 内置的是 **(seed×episode) 配对** Wilcoxon——把同一模型下相关的 64 条 episode 当独立样本,**伪重复、p 值虚低若干数量级**。**正式结论必须用种子级检验**(每种子取 64 条 eval 均值作 1 个重复单位,`seed_level_analysis.py` / `stress_cmp.py` / `nonstat_cmp.py`)。主实验种子数用 **12**(40–51),不是 spec 早期写的 5。
+
+---
+
+## 8. 回报归一化(ValueNorm)
+
+奖励被近乎恒定的利润地板(~328±8)主导,critic 直接回归原始回报会被大常数淹没 → `vf_explained_var≈0`、
+advantage 无信号。`cleanmarl/algos/value_norm.py`(PopArt 式)让 critic 在归一化空间回归、GAE/bootstrap
+在原始空间,实测 `vf_explained_var` 由 ≈0 升至 ~0.8。开关 `use_value_norm`(yaml,默认开)。**这是 B4 在
+修复统计口径后能与 B2 公平比较的前提。**
+
+---
+
+## 9. 组别 → 环境映射(`run_sweep.GROUP_ENV_MAP`)
 
 | 组 | mechanism | allocation | 算法 | 备注 |
 | :-- | :-- | :-- | :-- | :-- |
-| A1/A2 | none | fair | rule_a1/a2 | 规则基线,θ 固定季节排程 |
-| A3/A4/A5/A6 | b2 | fair | ippo/mappo/happo(A6 低扰动) | 学习无互惠,煤企学 θ |
-| B1 | none | fair | rule_b1 | 公平规则基准 |
-| B2 | b2 | weighted | (YAML) | 非关系动态协调基准,λ=1,无记忆,无 ημg |
-| B3 | b3 | weighted | (YAML) | 规则互惠:学 θ + λ 依 χ̂ 触发,无记忆 |
-| B4 | b4 | weighted | (YAML) | 完整关系专属互惠,学 θ 和 λ,**含 ημg** |
-| C1–C6 | b4 变体 | weighted | (YAML) | C2=disable_g_u, C3=fixed_lambda, C4=freeze_memory, C5=freeze_theta, C6=去关系观测 |
-| C7 | b4 | weighted | (YAML) | η=0(`use_reciprocity_reward=False`),去互惠效用反证 |
+| A1/A2 | **b2** | fair | rule_a1/a2 | 派生 base-stock(A1 无安全 / A2 含安全),煤企用动作派生 θ |
+| A3–A6 | b2 | fair | ippo/mappo/happo(A6 低扰动) | 学习无互惠,学 θ |
+| B1 | **b2** | fair | rule_b1 | = A2 派生 base-stock(含安全库存) |
+| B2 | b2 | weighted | (YAML) | 非关系动态协调,λ=1,无记忆,无 ememory |
+| B3 | b3 | weighted | (YAML) | 规则互惠:学 θ + λ 依 χ̂ 触发 |
+| B4 | b4 | weighted | (YAML) | 完整关系互惠,学 θ 和 λ,含 ememory |
+| **B5** | **long_contract** | weighted | (YAML) | 双边静态长协:学 θ + 静态 ω/λ(名义日历),无互惠 |
+| C1–C6 | b4 变体 | weighted | (YAML) | C2 disable_g_u / C3 fixed_lambda / C4 freeze_memory / C5 freeze_theta / C6 no_recip_in_obs |
+| C7 | b4 | weighted | (YAML) | η=0(no_recip_reward)|
 
-`--group` 会自动绑定机制,避免"策略 B1 但环境 B4"错配;规则组用 `force_algo` 强制规则策略,所以
-`--config` 用哪个 yaml 都行(只取它的环境 + 超参)。单组跑:`--group B4`;单种子:`--seeds 42`;
-冒烟:`--timesteps 1560`(1 rollout,**只验管线,数值无意义**)。
-
----
-
-## 8. 为什么能做配对检验(固定评估轨迹)
-
-训练随机性与评估随机性**故意分开**:
-
-- 训练种子(`--seeds 40..44`)→ 决定训练随机流(5 个种子 = 方法重复 5 次)。
-- 评估走 `env.eval_reset(episode_idx)`,内部固定 `rng = default_rng(9000 + episode_idx)`,**与训练种子无关**。
-  所以任何组别/种子,评估都在**同一批 64 条固定轨迹**(episode 0..63 ↔ 种子 9000..9063)上跑。
-
-→ `B4-seed40-ep5` 和 `B2-seed40-ep5` 面对**完全相同的需求实现**,差异只来自机制本身。这就是
-`analyze_experiments.py` 按 (seed, episode) 配对做 Wilcoxon 的前提,消掉"剧本难易"这一最大噪声源。
+`--group` 自动绑定机制;规则组用 `force_algo` 强制规则策略,`--config` 取哪个 yaml 都行(只用它的环境+超参)。
+单组 `--group B4`;单种子 `--seeds 42`;冒烟 `--timesteps 1560`(只验管线,数值无意义)。
 
 ---
 
-## 9. 分析脚本
-
-```bash
-python cleanmarl/analyze_experiments.py --experiment exp2          # 出组间表 + 默认配对检验
-python cleanmarl/analyze_experiments.py --experiment exp2 --groups B2,B3,B4 --pairs B4:B2 \
-       --metric system_profit,SR --csv out.csv
-```
-
-- 默认配对:exp2 = `B4:B2 / B4:B3 / B4:B1`;exp3 = `C1:C7 / C1:C5 / C1:C2/C3/C4/C6`。
-- 报告指标均为**奖励加项之外的独立量**:SR、SR_1、SR_N、Jain、系统/煤企/电企利润、θ 路径、爬坡命中率、
-  紧张期前 Ḡ、λ₁、g^U/g^C、μ 轨迹。
-- 每个 run 目录含 `config.json / progress.csv / episode_summary.csv / run_meta.json`。
-
----
-
-## 10. 快速冒烟
-
-```bash
-# 单组管线冒烟(1 rollout, cpu): 确认端到端不崩
-python cleanmarl/run_sweep.py --config configs/happo_cpdre.yaml --group B4 --seeds 42 --timesteps 1560 --device cpu
-```
-
-最近一次(0626 落地后)机制冒烟确认:平台季节(旺 1.2 / 淡 0.8 / 年均 1.0)、价格恒 1、χ 两边穿越
-(宽松≈48% / 紧张≈52%)、g^U/g^C 真实点火(B4 日志 mean_g_u≈0.42、mean_g_c≈0.10、μ_c→0.74、
-λ₁≈1.48)、b2 干净(Σ|g|=0、λ≡1)。**正式结论仍需跑满 `total_timesteps`(1e5)× 5 种子。**
-
----
-
-## 11. 代码结构
+## 10. 代码结构
 
 ```text
 cleanmarl/
-├── algos/{happo,mappo,ippo,rule_policy}.py   # 算法 + 规则/固定基线
-├── configs/{default,happo_cpdre,ippo_cpdre,mappo_cpdre}.yaml
-├── core/{trainer,logger,episode_logger}.py   # 训练循环 + 指标/进度日志
-├── envs/cpdre_wrapper.py                      # CPDRE numpy wrapper
-├── models/models.py                           # GRUActor / CentralizedCritic
-├── train.py            # 单次训练入口(YAML)
-├── run_sweep.py        # 多种子/多组别扫描 + --experiment 预设 + GROUP_ENV_MAP
-└── analyze_experiments.py  # 组间表 + 配对 Wilcoxon/bootstrap
+├── algos/{happo,mappo,ippo,rule_policy}.py   # 算法 + 规则基线
+├── algos/value_norm.py                       # ValueNorm 回报归一化(PopArt 式)
+├── configs/{happo,mappo,ippo,default}_cpdre.yaml + happo_cpdre_{K30,nonstat}.yaml
+├── core/{trainer,logger,episode_logger}.py
+├── models/models.py                          # GRUActor / CentralizedCritic
+├── run_sweep.py        # 多种子/组别扫描 + --experiment 预设 + GROUP_ENV_MAP + set_seed
+├── analyze_experiments.py  # 组间表 + 配对检验(episode 级, 见 §7 警示)
+└── _run_*.sh           # 零参数确定性并行启动器
 ```
-
 环境本体:`custom_envs/coal_power_direct_reciprocity_env.py`。
+根目录 `seed_level_analysis.py / stress_cmp.py / nonstat_cmp.py` 为**种子级诚实分析器**。
 
 ---
 
-## 12. 0626 对齐状态与已知缺口
+## 11. 已知缺口
 
-**已对齐 0626**:平台型季节(均值守恒)、价格固定 1、`g^C` 基准产能公平基准 + `g^U` 剩余供给减少、
-互惠效用 ημg 进主模型(C7 可关)、`K=1.2mD̄` 留旺季余量、`γ=0.99`、`c_rep=1.70`、连续动作 squash 后算 log-prob、
-B5 已删 / B3→b3 / 新增 C7。
+- `analyze_experiments.py` 仍是 episode 级检验(p 值虚低),正式结论用种子级分析器(§7)。建议后续把种子级并入。
+- C5 旧结果用反向坏 θ 排程跑的,须用修正排程(0.95/1.20)重跑。
+- 实验四/五/六(参数敏感性 / 规模范围 / 真实数据)未在 `run_sweep` 做一键预设。
+- 中途评估不触发(`eval_freq` 与 rollout 步数对不上),只有 final eval 写 `phase=eval`;中途中断的 run 无 eval 行(白跑)。
+- 多互惠 `h>1`、多电企 `m>3` 的观测/日志仍有 u1/u2/u3、pad3 等固定写法,扩展前需改 schema。
+- B5 的 long_contract 已移出互惠模式集合,g/μ 恒 0(行为零影响,已验证)。
 
-**已知缺口**(详见 `model/0625_issues.md`、`model/cleanmarl_0611_issues.md`):
+---
 
-- 实验四/五/六未在 `run_sweep` 做一键预设(目前靠改 yaml / 单独脚本)。
-- HAPPO advantage 迭代是相邻 agent 简化传播,非完整 Kuba 2022 联合 ratio(已声明不依赖单调性)。
-- 中途评估从不触发(`eval_freq` 与 rollout 步数对不上),只有训练结束的 final eval 写 `phase=eval`;
-  中途 Ctrl+C 的 run 无 eval 行。
-- 多互惠 `h>1`、多电企 `m>3` 的观测/日志仍有 `u1/u2/u3`、`pad3` 等固定写法,扩展前需先改 schema。
+## 12. 阶段性结论(供论文)
+
+- 学习型稳超规则基线(利润);系统稳定性的决定因素是**可学习的产能路径 θ**(C5 冻结即崩)。
+- **稳态、可签约环境**:动态直接互惠在系统利润上 ≈ 非关系协调 ≈ 静态长协(null);互惠是**伙伴专属的供应安全再分配**,非系统效率改进——学出的动态互惠收敛到最优静态合同。
+- **非稳态环境**:动态互惠**稳健保护伙伴**,静态长协因日历错配而保护崩溃 → 直接互惠的独特价值在**合同失效地带**(不确定/冲击/背叛/多伙伴)。头条指标:伙伴供应可靠性 / 抗冲击鲁棒性。
