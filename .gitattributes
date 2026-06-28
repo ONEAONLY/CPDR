@@ -1,0 +1,10 @@
+# 保证脚本/代码在 Linux 服务器上是 LF 行尾 (否则 .sh 带 CRLF 会 "bad interpreter: bash\r")
+* text=auto
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+# 二进制不转换
+*.docx binary
+*.pdf  binary

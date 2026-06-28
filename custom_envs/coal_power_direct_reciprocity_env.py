@@ -81,14 +81,29 @@ class CPDREConfig:
     mechanism_mode: str = "none"
     allocation_mode: str = "fair"     # fair, weighted
     demand_mode: str = "deterministic"  # deterministic, low_noise, lognormal, truncated_normal, ar1
-    price_mode: str = "seasonal"      # fixed, seasonal, feedback
+    price_mode: str = "fixed"         # 0626: price fixed to 1; fixed/seasonal/feedback
 
-    # Demand process (model 4.3.1): D_{i,t} = D_bar * s^D_t * eta_{i,t},
-    # s^D_t = 1 + a_D * sin(2*pi*(t - phi_D)/W).
+    # Demand process (model 0626 4.2.1): D_{i,t} = D_bar * s^D_t * xi_{i,t},
+    # PLATEAU seasonal factor (mean-preserving over the year):
+    #   s^D_t = 1 + a_D*(W-W_on)/W  in the peak window [phi_D, phi_D+W_on) (mod W),
+    #   s^D_t = 1 - a_D*W_on/W       otherwise.
+    # a_D is the peak-trough demand GAP; the coefficients keep the annual mean = 1
+    # so D_bar / K calibration is invariant to W_on.
     demand_offpeak: float = 1.0       # = D_bar (mean weekly demand)
-    demand_peak: float = 1.4          # legacy two-level peak (kept for legacy modes)
-    demand_season_amp: float = 0.20   # a_D (model 4.5.2)
-    demand_season_phi: int = 0        # phi_D, phase in weeks
+    demand_peak: float = 1.4          # legacy two-level peak (kept for legacy rule modes)
+    demand_season_amp: float = 0.40   # a_D = peak-trough gap (model 0626 4.2.1)
+    demand_season_phi: int = 13       # phi_D, peak-window start week (= nominal/contract calendar)
+    peak_weeks: int = 26              # W_on, length of the peak plateau (asymmetric if != W/2)
+    # 非稳态季节: 每年随机抽 (phi_D 旺季起始, W_on 旺季时长, a_D 幅度), 决策时不可观测.
+    #   需求按抽中的"真实"季节走; 而长协/规则按【名义日历】(上面 phi/peak_weeks/amp 固定值)
+    #   预承诺 -> 真实季节偏离名义时, 静态合同被错配, 动态策略(凭实现需求/压力 chi 适应)占优.
+    nonstationary_season: bool = False
+    season_phi_min: int = 6           # phi_D ~ U[min,max]
+    season_phi_max: int = 22
+    season_won_min: int = 16          # W_on ~ U[min,max]
+    season_won_max: int = 34
+    season_amp_min: float = 0.30      # a_D ~ U[min,max]
+    season_amp_max: float = 0.55
     demand_sigma: float = 0.15        # sigma_D multiplicative noise stdev
     demand_ar1_rho: float = 0.60
     demand_corr: float = 0.0          # cross-firm correlation (model exp4 D0-D3)
@@ -98,15 +113,15 @@ class CPDREConfig:
     demand_common_pool: bool = False  # model exp4 D3: all firms face same shock
 
     # Supply process (model 4.3.1): G_t = theta_t * K, K = m * D_bar.
-    K_capacity: Optional[float] = None  # K; None -> m * demand_offpeak (model 4.5.2)
+    K_capacity: Optional[float] = None  # K; None -> 1.2 * m * D_bar (model 0626 table 4-6)
     theta_min: float = 0.70           # model 4.5.2
     theta_max: float = 1.20
     theta_init: float = 1.0           # initial capacity utilization (first step)
     rho_max: float = 0.05             # ramp constraint (model 4.5.2)
     # legacy season-based theta (used only by legacy none/rule modes that do not
     # learn theta): kept for backward compatibility of rule baselines.
-    theta_offpeak: float = 1.15
-    theta_peak: float = 0.80
+    theta_offpeak: float = 0.95   # 固定季节排程 (none/freeze_theta/trigger 用): 旺季多产、
+    theta_peak: float = 1.20      # 淡季适度建库存. 旧值 1.15/0.80 是反的(旺季减产), 已修正.
     supply_sigma: float = 0.0
 
     # Price
@@ -148,10 +163,10 @@ class CPDREConfig:
     trust_threshold_c: float = 0.40   # rule-reciprocity trigger (model 4.5.2)
     trust_threshold_u: float = 0.40
 
-    # Reciprocity reward coefficients. Model 4.3.5/4.3.6 EXPLICITLY EXCLUDES the
-    # eta*mu*g term from the main-model reward. It is kept behind a flag for the
-    # extension ablation only (model 4.5.5 note). Default False = main model.
-    use_reciprocity_reward: bool = False
+    # 0626 main model RE-INCLUDES the eta*mu*g reciprocity utility (model 4.4.3).
+    # Default True; the C7 ablation sets it False to test "non reward-shaping".
+    # Gated by _reciprocity_enabled(), so it only applies to b4-family modes.
+    use_reciprocity_reward: bool = True
     eta_c: float = 0.30
     eta_u: float = 0.30
 
@@ -161,7 +176,7 @@ class CPDREConfig:
     unsold_cost: float = 0.10         # legacy idle cost; NOT used in main model
     power_unit_revenue: float = 1.80  # r
     holding_cost: float = 0.03        # h
-    c_rep: float = 1.60               # external emergency purchase price (p<c_rep<r)
+    c_rep: float = 1.70               # external emergency purchase price (1<c_rep<r), model 0626 table 4-6
     xi_lost: float = 5.00             # lost-load penalty (robustness scenario only)
     shortage_cost: float = 5.00       # legacy alias of xi_lost; kept for old configs
 
@@ -329,8 +344,10 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
         self.theta_prev = float(self.config.theta_init)
         self.theta_raw = float(self.config.theta_init)
         self.last_ramp_hit = False
+        # 0626 table 4-6: K = 1.2 * m * D_bar (rated capacity with peak headroom so
+        # theta^base < theta_max in the peak window -> non-zero-sum guarantee room).
         self.K = float(self.config.K_capacity) if self.config.K_capacity is not None \
-            else float(self.num_power) * float(self.config.demand_offpeak)
+            else 1.2 * float(self.num_power) * float(self.config.demand_offpeak)
         self.current_supply = float(self.theta * self.K)
         self.price = float(self.config.price_offpeak)
 
@@ -493,6 +510,7 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
     def reset(self) -> Dict[str, Dict[str, np.ndarray]]:
         self.t = 0
         self.price = float(self.config.price_offpeak)
+        self._draw_season_params()   # 逐年季节参数 (非稳态时随机); 必须在首次用 _season 前
 
         if self._reciprocity_enabled():
             self.mu_c = np.full(self.num_reciprocal, float(self.config.mu_c_init), dtype=np.float32)
@@ -693,6 +711,7 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
             q_base_u1=float(q_base_u1),
             shipments=shipments,
             shipments_fair=shipments_fair,
+            shipments_base_u=shipments_base_u,
         )
 
 
@@ -825,24 +844,62 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
     # ------------------------------------------------------------------
     # Core dynamics
     # ------------------------------------------------------------------
+    def _draw_season_params(self) -> None:
+        """逐年抽取季节参数 (phi_D, W_on, a_D). 稀疏稳态时全年用 config 固定值;
+        非稳态时每年从 U[min,max] 独立抽 -> 旺季起始/时长/幅度逐年随机, 决策时不可观测.
+        从 self.rng 抽 -> eval_reset(idx) 固定后该 episode 的季节序列可复现 (配对检验前提)."""
+        W = max(int(self.config.weeks_per_year), 1)
+        n_years = int(self.config.episode_len) // W + 2
+        if not bool(getattr(self.config, "nonstationary_season", False)):
+            p = (int(self.config.demand_season_phi), int(self.config.peak_weeks),
+                 float(self.config.demand_season_amp))
+            self._season_params = [p] * n_years
+            return
+        ps = []
+        for _ in range(n_years):
+            phi = int(self.rng.integers(int(self.config.season_phi_min), int(self.config.season_phi_max) + 1))
+            won = int(self.rng.integers(int(self.config.season_won_min), int(self.config.season_won_max) + 1))
+            amp = float(self.rng.uniform(float(self.config.season_amp_min), float(self.config.season_amp_max)))
+            ps.append((phi, won, amp))
+        self._season_params = ps
+
+    def _year_params(self, t: int):
+        """返回第 (t//W) 年的 (phi, W_on, a_D); 未抽时回退到 config 固定值."""
+        W = max(int(self.config.weeks_per_year), 1)
+        yr = int(t) // W
+        params = getattr(self, "_season_params", None)
+        if params and yr < len(params):
+            return params[yr]
+        return (int(self.config.demand_season_phi), int(self.config.peak_weeks),
+                float(self.config.demand_season_amp))
+
+    @staticmethod
+    def _plateau_in_peak(t: int, W: int, phi: int, won: int) -> bool:
+        won = int(np.clip(won, 0, W))
+        return ((int(t) % W - int(phi)) % W) < won
+
     def _season(self, t: int) -> int:
-        # Legacy binary season used only by the old rule reciprocity modes
-        # (long_contract / trigger) and the state-aware base-stock helper.
-        week = t % self.config.weeks_per_year
-        return 0 if week < self.config.off_peak_weeks else 1
+        # 真实季节 (驱动需求): 平台窗 [phi_D, phi_D+W_on); 非稳态时用当年随机参数.
+        W = max(int(self.config.weeks_per_year), 1)
+        phi, won, _ = self._year_params(t)
+        return 1 if self._plateau_in_peak(t, W, phi, won) else 0
+
+    def _season_nominal(self, t: int) -> int:
+        # 名义季节 (合同/规则按此预承诺): 永远用 config 固定日历, 非稳态下会被错配.
+        W = max(int(self.config.weeks_per_year), 1)
+        return 1 if self._plateau_in_peak(t, W, int(self.config.demand_season_phi),
+                                          int(self.config.peak_weeks)) else 0
 
     def _seasonal_factor(self, t: int) -> float:
-        """Sinusoidal seasonal demand factor s^D_t (model 4.3.1).
-
-        s^D_t = 1 + a_D * sin(2*pi*(t - phi_D)/W). When a_D == 0 the demand is
-        flat (no seasonality). The factor is the same for all firms.
-        """
-        a_D = float(self.config.demand_season_amp)
+        """真实平台季节需求因子 s^D_t (mean-preserving, 年均=1). 非稳态用当年 (phi,W_on,a_D)."""
+        W = max(int(self.config.weeks_per_year), 1)
+        phi, won, a_D = self._year_params(t)
         if abs(a_D) <= EPS:
             return 1.0
-        W = max(int(self.config.weeks_per_year), 1)
-        phi = float(self.config.demand_season_phi)
-        return float(1.0 + a_D * np.sin(2.0 * np.pi * (float(t) - phi) / float(W)))
+        won = int(np.clip(won, 0, W))
+        if self._plateau_in_peak(t, W, phi, won):
+            return float(1.0 + a_D * (W - won) / W)
+        return float(1.0 - a_D * won / W)
 
     def _year_position(self, t: Optional[int] = None) -> float:
         if t is None:
@@ -875,15 +932,16 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
         self.current_supply = float(max(supply, 0.0))
 
     def _base_demand_vector(self, season: int) -> np.ndarray:
-        # Model 4.3.1: base demand = D_bar * s^D_t (sinusoidal). The legacy
-        # off-peak/peak two-level scheme is used only by old rule modes that
-        # do not learn theta (mechanism_mode in {none, long_contract, trigger}).
-        mode = self.config.mechanism_mode.lower()
-        if mode in {"b2", "b4", "b5", "dynamic"}:
-            sf = self._seasonal_factor(self.t)
-            return np.ones(self.num_power, dtype=np.float32) * float(self.config.demand_offpeak) * sf
-        base = self.config.demand_offpeak if season == 0 else self.config.demand_peak
-        return np.ones(self.num_power, dtype=np.float32) * float(base)
+        # Model 0626 4.3.1: base demand = D_bar * s^D_t (plateau seasonal factor),
+        # mean-preserving (annual mean = 1). ALL mechanism modes use the SAME demand
+        # generation so that rule baselines (none) and learning modes (b2/b3/b4) face
+        # an identical demand distribution -> cross-mode comparison and the paired
+        # eval-trajectory Wilcoxon stay valid. (Until 2026-06 the non-learning modes
+        # wrongly used a legacy two-level scheme demand_offpeak/demand_peak = 1.0/1.4,
+        # which is ~1.25x the plateau 0.8/1.2 and confounded every baseline-vs-learner
+        # comparison; that branch is removed.)
+        sf = self._seasonal_factor(self.t)
+        return np.ones(self.num_power, dtype=np.float32) * float(self.config.demand_offpeak) * sf
 
     def _safe_inventory_vector(self, season: int) -> np.ndarray:
         base = self._base_demand_vector(season)
@@ -1043,23 +1101,41 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
             # Learning no-reciprocity baseline: both learn, lambda=1, no memory.
             weights[:] = 1.0
             theta_t = float(theta_raw)
+        elif mode == "b3":
+            # Rule reciprocity (model 0626 4.6.2): coal LEARNS theta; lambda follows
+            # a rule triggered by the observable pressure chi_hat (= chi_{t-1}, the
+            # value still held in self.chi_t before this period's update); no memory.
+            weights[:] = 1.0
+            if float(self.chi_t) > 0.0:
+                weights[self.reciprocal_idx[0]] = float(self.config.w_high)
+            theta_t = float(theta_raw)
         elif mode == "none":
             weights[:] = 1.0
-            theta_t = self.config.theta_offpeak if season == 0 else self.config.theta_peak
+            season_nom = self._season_nominal(self.t)
+            theta_t = self.config.theta_offpeak if season_nom == 0 else self.config.theta_peak
         elif mode == "long_contract":
+            # 双边静态长协 (B5, 对照真实电煤中长期合同的双边量承诺):
+            #   淡季 U1 提高订货覆盖 omega_high -> 迎峰前预先囤煤建库存 (买方承购义务);
+            #   旺季煤企对 U1 给静态高保供权重 w_high (卖方足额保供义务);
+            #   theta 由煤企【学习】(释放/调整产能), 与 b2/b3/b4 同口径可比.
+            # 是静态合同而非动态互惠: omega/lambda 为固定合同条款, 不随关系记忆调节.
+            # 关键: 按【名义日历】预承诺 (合同签约时的预期旺淡); 非稳态下真实季节偏离
+            # 名义时, 囤煤/保供会错位 -> 动态策略凭实现压力适应而占优.
             weights[:] = 1.0
-            if season == 0:
+            season_nom = self._season_nominal(self.t)
+            if season_nom == 0:
                 omega[0] = float(self.config.omega_high)
             else:
                 weights[0] = float(self.config.w_high)
-            theta_t = self.config.theta_offpeak if season == 0 else self.config.theta_peak
+            theta_t = float(theta_raw)
         elif mode == "trigger":
             weights[:] = 1.0
-            if season == 0 and self.mu_u_scalar >= self.config.trust_threshold_u:
+            season_nom = self._season_nominal(self.t)
+            if season_nom == 0 and self.mu_u_scalar >= self.config.trust_threshold_u:
                 omega[0] = float(self.config.omega_high)
-            if season == 1 and self.mu_c_scalar >= self.config.trust_threshold_c:
+            if season_nom == 1 and self.mu_c_scalar >= self.config.trust_threshold_c:
                 weights[0] = float(self.config.w_high)
-            theta_t = self.config.theta_offpeak if season == 0 else self.config.theta_peak
+            theta_t = self.config.theta_offpeak if season_nom == 0 else self.config.theta_peak
         else:
             raise ValueError(f"Unknown mechanism_mode: {self.config.mechanism_mode}")
 
@@ -1150,23 +1226,29 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
         q_base_u1: float,
         shipments: np.ndarray,
         shipments_fair: np.ndarray,
+        shipments_base_u: np.ndarray,
     ) -> Tuple[float, float]:
-        """Actual incremental reciprocity contributions gU and gC (model 4.3.4).
+        """Actual incremental reciprocity contributions gU and gC (model 0626 4.3.2).
 
         Both contributions are identified from ex-post realized transactions and
         gated on the supply-demand pressure chi_t (NOT on the calendar season):
 
-        gU (loose, chi_t <= 0): U1's incremental purchase support relative to the
-            base-stock counterfactual order:
-                gU_t = I(chi_t<=0) * min{ [Q_{1,t} - Q^{base}_{1,t}]^+ / (D_bar + eps), 1 }
-            Only counts when the system is loose, so U1 cannot earn fake
-            reciprocity by crowding out ordinary firms under rationing.
+        gU (loose, chi_t <= 0): U1's incremental purchase support measured by the
+            REDUCTION in the coal firm's leftover/idle supply (eq 4-15):
+                gU_t = I(chi<=0) * min{ [E^{base,U}_t - E_t]^+ / (D_bar+eps), 1 },
+                E_t = [G_t - sum Y]^+ ,  E^{base,U}_t = [G_t - sum Y^{base,U}]^+ ,
+            where Y^{base,U} replaces only U1's order with its base-stock order.
+            Counts U1's order only when it truly absorbs coal's surplus, so
+            crowding-out under rationing cannot earn fake reciprocity.
 
-        gC (tight, chi_t > 0): coal's incremental guarantee to U1 above the fair
-            allocation baseline:
-                gC_t = I(chi_t>0) * min{ [Y_{1,t} - Y^0_{1,t}]^+ / (D_bar + eps), 1 }
-            Only counts under rationing, so loose-period shipments that need no
-            competition are not misread as guarantee returns.
+        gC (tight, chi_t > 0): coal's incremental guarantee to U1 above the
+            BASE-CAPACITY fair baseline Y^{0,base} (eq 4-16):
+                gC_t = I(chi>0) * min{ [Y_{1,t} - Y^{0,base}_{1,t}]^+ / (D_bar+eps), 1 },
+                Y^{0,base}_1 = [ R(G^base_t, Q_t, 1) ]_1 ,
+                G^base_t = clip(sum_i D_bar*s^D_t / K, theta_min, theta_max) * K .
+            Using the base-capacity (not current-G) fair baseline makes gC capture
+            BOTH the non-zero-sum capacity lift (theta>theta_base) AND the zero-sum
+            weight tilt (lambda>1) -- the legitimate system-level winning channel.
         """
         if not self._reciprocity_enabled():
             return 0.0, 0.0
@@ -1175,15 +1257,20 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
         chi = float(self.chi_t)
 
         if chi <= 0.0:
-            # Loose: U1 order increment above the base-stock counterfactual.
-            # C2 ablation (disable_g_u): zero U1's purchase contribution.
-            g_u_raw = min(max(float(orders[0]) - float(q_base_u1), 0.0) / denom, 1.0)
-            g_u = 0.0 if self.config.disable_g_u else g_u_raw
+            # Loose: surplus-reduction contributed by U1's incremental order.
+            E_t = max(float(supply) - float(np.sum(shipments)), 0.0)
+            E_base_u = max(float(supply) - float(np.sum(shipments_base_u)), 0.0)
+            g_u_raw = min(max(E_base_u - E_t, 0.0) / denom, 1.0)
+            g_u = 0.0 if self.config.disable_g_u else g_u_raw  # C2 ablation
             g_c = 0.0
         else:
-            # Tight: coal's shipment to U1 above the fair-allocation baseline.
+            # Tight: shipment to U1 above the base-capacity fair baseline.
+            theta_base = float(np.clip(float(np.sum(base_demand)) / max(float(self.K), EPS),
+                                       self.config.theta_min, self.config.theta_max))
+            g_base = theta_base * float(self.K)
+            y0_base = self._allocate_supply(orders, g_base, np.ones(self.num_power, dtype=np.float32))
             g_u = 0.0
-            g_c = min(max(float(shipments[0] - shipments_fair[0]), 0.0) / denom, 1.0)
+            g_c = min(max(float(shipments[0]) - float(y0_base[0]), 0.0) / denom, 1.0)
 
         return float(g_u), float(g_c)
 
@@ -1215,8 +1302,11 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
 
     def _reciprocity_enabled(self) -> bool:
         # Only modes that USE relationship memory enable the reciprocity channel.
-        # b2/b5/none do not (b2 and b5 are learning baselines without relations).
-        return self.config.mechanism_mode.lower() in {"b4", "dynamic", "long_contract", "trigger"}
+        # long_contract (B5 双边静态长协) 不含关系互惠: 其 omega/lambda 为按名义日历签死
+        # 的静态合同条款, 不依赖 g/mu; 故移出互惠集合, 使 B5 的 g/mu 恒为 0 (干净)。
+        # 该改动对 B5 行为零影响 (B5 已 no_recip_reward + no_recip_in_obs + 静态 lambda),
+        # 只是不再计算并记录惰性的 g/mu。b2/b5/none 均不含关系。
+        return self.config.mechanism_mode.lower() in {"b4", "dynamic", "trigger"}
 
     def _compute_rewards(
             self,
@@ -1286,9 +1376,11 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
 
         rewards: Dict[str, float] = {}
 
-        # 5. Coal reward (model 4.3.6): r^C = pi_tilde^C - lambda_S*SR - lambda_J*(1-J).
-        # The eta*mu*g term is EXCLUDED from the main model (model 4.3.5); it is
-        # only used behind use_reciprocity_reward for the extension ablation.
+        # 5. Coal reward (model 0626 4.5): r^C = pi_tilde^C + eta_C*mu^C*g^C
+        #    - lambda_S*SR - lambda_J*(1-J).
+        # 0626 主模型【含】互惠效用 eta*mu*g (use_reciprocity_reward 默认 True, 仅对
+        # 互惠模式 b4 生效); C7 消融把 use_reciprocity_reward 置 False 去掉该项做反证。
+        # (此前注释误称 ememory 不在主模型, 与 0626 及实际行为相反, 已更正。)
         r_coal = coal_profit_norm
         if self.config.use_reciprocity_reward and self._reciprocity_enabled():
             r_coal += cfg.eta_c * float(mu_c_reward) * float(g_c)
@@ -1663,6 +1755,45 @@ class CoalPowerDirectReciprocityEnv(MultiAgentEnv):
         t_raw = self.normalized_action_from_theta(theta)
         l_raw = self.normalized_action_from_weight(lam)
         return np.array([float(t_raw[0]), float(l_raw[0])], dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Principled (parameter-free) base-stock baseline (model 0626  baseline).
+    # All quantities derive from demand forecast + cost ratio, NOT from
+    # hand-set constants or grid search on the eval set -> no test leakage.
+    # ------------------------------------------------------------------
+    def _critical_fractile_z(self) -> float:
+        """Newsvendor critical-fractile safety factor z = Phi^{-1}(Cu/(Cu+Co)),
+        with under-stock cost Cu = c_rep (emergency replenishment) and over-stock
+        cost Co = holding_cost. High c_rep/holding -> high service target."""
+        from scipy.stats import norm
+        cu = float(self.config.c_rep)
+        co = float(self.config.holding_cost)
+        service = cu / (cu + co + EPS)
+        service = min(max(service, 0.5), 0.9999)
+        return float(norm.ppf(service))
+
+    def baseline_power_omega(self, with_safety: bool = True) -> float:
+        """Order-up-to coverage (in demand-rate units) for the rule baseline.
+        Protection interval = lead_time + 1 review period; safety stock adds
+        z * CV * sqrt(protection). CV approximated by the lognormal demand sigma."""
+        protection = int(self.config.lead_time) + 1
+        if not with_safety:
+            return float(protection)
+        z = self._critical_fractile_z()
+        cv = float(self.config.demand_sigma)
+        return float(protection + z * cv * np.sqrt(protection))
+
+    def baseline_coal_theta(self, with_safety: bool = True) -> float:
+        """Produce-to-forecast coal utilization: theta*K covers this period's
+        expected total demand (m * D_bar * s^D_t) plus an optional safety buffer
+        z*CV, clipped to [theta_min, theta_max]. No hand-set theta schedule."""
+        s_t = self._seasonal_factor(self.t)
+        d_tot = float(self.num_power) * float(self.config.demand_offpeak) * s_t
+        buf = 0.0
+        if with_safety:
+            buf = self._critical_fractile_z() * float(self.config.demand_sigma)
+        theta = d_tot * (1.0 + buf) / (float(self.K) + EPS)
+        return float(np.clip(theta, self.config.theta_min, self.config.theta_max))
 
     def base_stock_action_dict(self, omega: Optional[float] = None,
                                theta: Optional[float] = None,

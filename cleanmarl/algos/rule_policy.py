@@ -52,61 +52,58 @@ class RulePolicy:
 
     # ---------------- 规则动作产出 ----------------
     def _coal_action(self, season: int) -> np.ndarray:
-        """返回煤企 2D 归一化动作 (theta_raw, lambda_raw)."""
-        cfg = self.env.env.config
+        """返回煤企 2D 归一化动作 (theta_raw, lambda_raw).
+
+        theta 由派生式 produce-to-forecast 规则给出 (env.baseline_coal_theta),
+        从需求预测 + 成本临界分位推出, 无手设常数/无评估集拟合. A1=无安全库存,
+        A2/B1=含成本感知安全库存. (运行机制为 b2: env 用动作里的 theta, lambda 强制 1.)
+        """
+        env = self.env.env
+        cfg = env.config
         variant = self.variant
-        # 默认: theta 取季节档 (rule/fixed 基准不学 theta), lambda=1 (公平).
-        theta = cfg.theta_offpeak if season == 0 else cfg.theta_peak
         lam = 1.0
 
         if variant in ("fixed", "rule_a1"):
-            theta = cfg.theta_init if season == 0 else cfg.theta_peak
-            lam = 1.0
-        elif variant == "rule_a2":
-            # 状态感知 base-stock: theta 跟季节, lambda 公平.
-            theta = cfg.theta_offpeak if season == 0 else cfg.theta_peak
-            lam = 1.0
-        elif variant == "rule_b1":
-            theta = cfg.theta_offpeak if season == 0 else cfg.theta_peak
-            lam = 1.0
+            # A1 朴素 base-stock: 仅覆盖期望需求, 无安全库存.
+            theta = env.baseline_coal_theta(with_safety=False)
+        elif variant in ("rule_a2", "rule_b1"):
+            # A2 / B1 成本感知 base-stock: + newsvendor 安全库存.
+            theta = env.baseline_coal_theta(with_safety=True)
         elif variant == "rule_b3":
-            # 规则互惠: 用 chi_hat 判宽松/紧张.
-            # 宽松 (chi_ma<=0): U1 高覆盖已在 _power_action 处理; 煤企 lambda=1.
-            # 紧张 (chi_ma>0): 煤企高保供权重 lambda=lambda_max.
-            theta = cfg.theta_offpeak if season == 0 else cfg.theta_peak
+            # 规则互惠: theta 同 base-stock; 紧张 (chi_ma>0) 煤企高保供权重.
+            theta = env.baseline_coal_theta(with_safety=True)
             lam = float(cfg.lambda_max) if self._chi_ma > 0 else 1.0
         elif variant == "rule_b4":
             # 规则版关系互惠: 用煤企关系记忆 mu_c 触发紧张期保供.
-            mu_c = self.env.env.mu_c_scalar
-            theta = cfg.theta_offpeak if season == 0 else cfg.theta_peak
+            mu_c = env.mu_c_scalar
+            theta = env.baseline_coal_theta(with_safety=True)
             lam = float(cfg.lambda_max) if (season == 1 and mu_c >= cfg.trust_threshold_c) else 1.0
+        else:
+            theta = env.baseline_coal_theta(with_safety=True)
 
-        return self.env.env.coal_action(float(theta), float(lam))
+        return env.coal_action(float(theta), float(lam))
 
     def _power_omega(self, idx: int, season: int) -> np.ndarray:
-        cfg = self.env.env.config
+        """电企 order-up-to 覆盖 omega. 由派生式 base-stock 给出
+        (env.baseline_power_omega): 保护期 = lead+1, 安全库存 = z*CV*sqrt(保护期).
+        A1=无安全, A2/B1=含安全. 无手设魔法数."""
+        env = self.env.env
+        cfg = env.config
         variant = self.variant
         is_u1 = (idx == 0)
         if variant in ("fixed", "rule_a1"):
-            omega = cfg.omega_base
+            omega = env.baseline_power_omega(with_safety=False)
         elif variant in ("rule_a2", "rule_b1"):
-            # 状态感知 base-stock: 季节性覆盖周期.
-            omega = cfg.omega_base if season == 0 else 2.5
+            omega = env.baseline_power_omega(with_safety=True)
         elif variant == "rule_b3":
-            # 规则互惠: 宽松期 U1 高覆盖, 其余 base-stock.
-            if is_u1 and self._chi_ma <= 0:
-                omega = cfg.omega_high
-            else:
-                omega = cfg.omega_base if season == 0 else 2.5
+            # 规则互惠: 宽松期 U1 高覆盖, 其余派生 base-stock.
+            omega = cfg.omega_high if (is_u1 and self._chi_ma <= 0) else env.baseline_power_omega(with_safety=True)
         elif variant == "rule_b4":
-            mu_u = self.env.env.mu_u_scalar
-            if is_u1 and season == 0 and mu_u >= cfg.trust_threshold_u:
-                omega = cfg.omega_high
-            else:
-                omega = cfg.omega_base if season == 0 else 2.5
+            mu_u = env.mu_u_scalar
+            omega = cfg.omega_high if (is_u1 and season == 0 and mu_u >= cfg.trust_threshold_u) else env.baseline_power_omega(with_safety=True)
         else:
-            omega = cfg.omega_base
-        return self.env.env.normalized_action_from_omega(float(omega))
+            omega = env.baseline_power_omega(with_safety=True)
+        return env.normalized_action_from_omega(float(omega))
 
     def _build_action(self, obs: np.ndarray) -> np.ndarray:
         """从 obs 构造 (num_agents, max_act_dim) 动作矩阵."""

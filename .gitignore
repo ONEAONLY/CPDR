@@ -162,3 +162,16 @@ cython_debug/
 #.idea/
 # Claude Code local state
 .claude/
+
+# ===== CPDRE 项目: 不提交可重新生成的产物与大文件 =====
+# 实验结果 (服务器重跑会重新生成; ~163M)
+logs/
+logs/**
+# 模型检查点 (~1.4G, 重跑生成)
+checkpoints/
+checkpoints/**
+# scratchpad / 临时
+*_old_bak/
+# model 目录里的大二进制 (跑实验用不到; 想备份可单独传)
+model/*.docx
+model/*.pdf

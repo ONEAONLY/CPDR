@@ -35,22 +35,29 @@ from cleanmarl.envs.cpdre_wrapper import make_cpdre_env
 # force_algo: None=沿用YAML算法; "rule_xxx"/"fixed"=强制规则策略
 GROUP_ENV_MAP = {
     # 实验一: 基线 + 算法选择 (均无互惠).
-    # A1/A2 规则基线: none 模式煤企用固定季节排程 theta, 电企用 base-stock 规则.
-    # A3/A4/A5/A6 学习基线: b2 模式 (学习/无关系记忆/lambda=1) 让煤企从公共状态
-    #   学 theta, 以验证 "产能路径可被学习策略稳定控制" (doc 4.5.3). 用 none 会把
-    #   theta 钉死成排程, 等于没验证产能路径可学.
-    "A1": dict(mechanism_mode="none",    allocation_mode="fair",     force_algo="rule_a1"),
-    "A2": dict(mechanism_mode="none",    allocation_mode="fair",     force_algo="rule_a2"),
+    # A1/A2 规则基线: b2 模式 (煤企用动作里的派生 theta, lambda 强制 1, 公平配给),
+    #   策略为 RulePolicy 派生式 base-stock (env.baseline_coal_theta/power_omega).
+    #   *必须用 b2 不用 none*: none 会把 theta 钉死成手设季节排程, 且历史上 none 还
+    #   误用遗留两档需求(1.0/1.4)而 b 模式用平台需求(0.8/1.2), 两者不可比 (已修).
+    #   用 b2 让基线与学习组(A3-A6/B2-B4)面对完全相同的需求与执行管线.
+    # A3/A4/A5/A6 学习基线: b2 模式让煤企从公共状态学 theta (doc 4.5.3).
+    "A1": dict(mechanism_mode="b2",      allocation_mode="fair",     force_algo="rule_a1"),
+    "A2": dict(mechanism_mode="b2",      allocation_mode="fair",     force_algo="rule_a2"),
     "A3": dict(mechanism_mode="b2",      allocation_mode="fair",     force_algo="ippo"),
     "A4": dict(mechanism_mode="b2",      allocation_mode="fair",     force_algo="mappo"),
     "A5": dict(mechanism_mode="b2",      allocation_mode="fair",     force_algo="happo"),
     "A6": dict(mechanism_mode="b2",      allocation_mode="fair",     force_algo="happo", low_noise=True),
     # 实验二: 机制比较 (核心)
-    "B1": dict(mechanism_mode="none",    allocation_mode="fair",     force_algo="rule_b1"),
+    "B1": dict(mechanism_mode="b2",      allocation_mode="fair",     force_algo="rule_b1"),
     "B2": dict(mechanism_mode="b2",      allocation_mode="weighted", force_algo=None),
-    "B3": dict(mechanism_mode="none",    allocation_mode="weighted", force_algo="rule_b3"),
+    "B3": dict(mechanism_mode="b3",      allocation_mode="weighted", force_algo=None),
     "B4": dict(mechanism_mode="b4",      allocation_mode="weighted", force_algo=None),
-    "B5": dict(mechanism_mode="b5",      allocation_mode="weighted", force_algo=None),
+    # B5 双边静态长协 (对照真实电煤中长期合同): 学 theta; 淡季 U1 提高 omega 预先囤煤
+    #   (买方承购义务), 旺季煤企对 U1 静态高保供权重 w_high (卖方保供义务); 无互惠
+    #   奖励/记忆/观测 -> 静态双边合同, 不随关系记忆动态调节. 对照 B3(按压力触发)与
+    #   B4(按关系记忆学习), 隔离"动态关系互惠 vs 静态双边长协".
+    "B5": dict(mechanism_mode="long_contract", allocation_mode="weighted", force_algo=None,
+               no_recip_reward=True, no_recip_in_obs=True),
     # 实验三: 消融 (均为 b4 变体)
     "C1": dict(mechanism_mode="b4",      allocation_mode="weighted", force_algo=None),
     "C2": dict(mechanism_mode="b4",      allocation_mode="weighted", force_algo=None, disable_g_u=True),
@@ -58,16 +65,17 @@ GROUP_ENV_MAP = {
     "C4": dict(mechanism_mode="b4",      allocation_mode="weighted", force_algo=None, freeze_memory=True),
     "C5": dict(mechanism_mode="b4",      allocation_mode="weighted", force_algo=None, freeze_theta=True),
     "C6": dict(mechanism_mode="b4",      allocation_mode="weighted", force_algo=None, no_recip_in_obs=True),
+    "C7": dict(mechanism_mode="b4",      allocation_mode="weighted", force_algo=None, no_recip_reward=True),
 }
 
 # 实验 -> 组别列表 (一条命令跑完整个实验).
 #   exp1: 基线 + 算法选择 (无互惠)
-#   exp2: 直接互惠机制主实验 (B4 vs B5 为核心对比)
-#   exp3: 机制来源消融 (均为 b4 变体)
+#   exp2: 直接互惠机制主实验 (B4 vs B2 为头条对比; 见 model 0626 式4-27)
+#   exp3: 机制来源消融 (均为 b4 变体; C7=去互惠效用 eta=0 反证)
 EXPERIMENTS = {
     "exp1": ["A1", "A2", "A3", "A4", "A5", "A6"],
-    "exp2": ["B1", "B2", "B3", "B4", "B5"],
-    "exp3": ["C1", "C2", "C3", "C4", "C5", "C6"],
+    "exp2": ["B1", "B2", "B3", "B4"],
+    "exp3": ["C1", "C2", "C3", "C4", "C5", "C6", "C7"],
 }
 
 
@@ -90,6 +98,9 @@ def apply_group(cfg, group):
         cfg['env']['freeze_memory'] = True
     if spec.get('no_recip_in_obs'):
         cfg['env']['include_reciprocity_in_obs'] = False
+    if spec.get('no_recip_reward'):
+        # C7 ablation: turn off the eta*mu*g reciprocity utility (model 0626 4.6.3).
+        cfg['env']['use_reciprocity_reward'] = False
     if 'fixed_lambda' in spec:
         cfg['env']['fixed_coal_weight'] = float(spec['fixed_lambda'])
     if spec.get('low_noise'):
@@ -160,6 +171,12 @@ def run_one(cfg, seed, device=None, timesteps=None):
     }
     with open(run_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # 固定全局随机种子 (torch + numpy): 否则网络初始化/动作采样每个 run 都不同,
+    # 制造 ±13/种子 的 run 间噪声底, 把 ~6 的机制效应 (B4 vs B2) 淹没. 固定后同一
+    # seed 下不同机制组共享相同初始化 -> 机制差异被干净隔离, 统计功效大增.
+    from cleanmarl.utils import set_seed
+    set_seed(int(seed))
 
     env = make_cpdre_env(cfg['env'])
     policy = build_policy(algo, env, train_config)

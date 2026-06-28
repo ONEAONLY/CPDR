@@ -13,12 +13,13 @@ env:
   mechanism_mode: "b4"      # none / b2 / b4 / b5 / dynamic / long_contract / trigger
   allocation_mode: "fair"
   demand_mode: "lognormal"        # 主实验: 季节性 + 乘性随机扰动 (model 4.3.1); deterministic 仅 A6 对照
-  price_mode: "seasonal"         # fixed / seasonal / feedback
+  price_mode: "fixed"         # fixed / seasonal / feedback
   # Demand process (model 4.3.1): sinusoidal s^D_t = 1 + a_D sin(2pi(t-phi)/W)
   demand_offpeak: 1.0       # D_bar
   demand_peak: 1.4          # legacy two-level (rule modes only)
-  demand_season_amp: 0.20   # a_D
-  demand_season_phi: 0      # phi_D (weeks)
+  demand_season_amp: 0.40   # a_D
+  demand_season_phi: 13      # phi_D (weeks)
+  peak_weeks: 26
   demand_sigma: 0.15        # sigma_D
   demand_ar1_rho: 0.60
   demand_corr: 0.0          # cross-firm correlation (exp4 D0-D3)
@@ -30,8 +31,8 @@ env:
   theta_max: 1.20
   theta_init: 1.0
   rho_max: 0.05             # ramp constraint
-  theta_offpeak: 1.15       # legacy schedule (rule modes only)
-  theta_peak: 0.80
+  theta_offpeak: 0.95       # legacy schedule (rule modes only)
+  theta_peak: 1.20
   supply_sigma: 0.0
   # Price (model 4.5.2: p^base = 1.00)
   price_offpeak: 1.0
@@ -57,13 +58,13 @@ env:
   delta_u: 0.005
   trust_threshold_c: 0.40   # rule-reciprocity trigger
   trust_threshold_u: 0.40
-  use_reciprocity_reward: false  # main model EXCLUDES eta*mu*g (model 4.3.5)
+  use_reciprocity_reward: true   # 0626: main model includes eta*mu*g (gated to b4)
   # Economic params (model 4.5.2 table 4.2)
   p_base: 1.00
   coal_unit_cost: 0.70      # c^C (on G_t)
   power_unit_revenue: 1.80  # r
   holding_cost: 0.03        # h
-  c_rep: 1.60               # external emergency purchase price (p < c_rep < r)
+  c_rep: 1.70               # external emergency purchase price (p < c_rep < r)
   xi_lost: 5.00             # lost-load penalty (robustness only)
   # Reward weights (model 4.5.2 table 4.2)
   lambda_coal_shortage: 0.50   # lambda_S
@@ -87,7 +88,7 @@ train:
 
 # PPO 核心参数 (对齐 model 0611(1).md 表4.3)
 ppo:
-  gamma: 0.95               # 折扣因子
+  gamma: 0.99               # 折扣因子
   gae_lambda: 0.95          # GAE lambda
   clip_param: 0.20          # PPO clip
   value_clip_param: 10.0    # 价值函数 clip

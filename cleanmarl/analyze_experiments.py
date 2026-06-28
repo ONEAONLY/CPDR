@@ -31,14 +31,15 @@ except Exception:
 EXPERIMENT_GROUPS = {
     "exp1": ["A1", "A2", "A3", "A4", "A5", "A6"],
     "exp2": ["B1", "B2", "B3", "B4", "B5"],
-    "exp3": ["C1", "C2", "C3", "C4", "C5", "C6"],
+    "exp3": ["C1", "C2", "C3", "C4", "C5", "C6", "C7"],
 }
 
-# 默认配对检验对 (实验二核心: B4 是否优于无互惠 B2 / 非关系动态协调 B5).
+# 默认配对检验对 (model 0626 式4-27 头条: B4 vs B2 非关系动态协调).
+# C1=完整B4; C1 vs C7 = 去互惠效用(eta=0)的结构性价值; C1 vs C5 = 超出纯配给.
 DEFAULT_PAIRS = {
     "exp1": [],
-    "exp2": [("B4", "B2"), ("B4", "B5"), ("B4", "B3")],
-    "exp3": [("C1", "C2"), ("C1", "C3"), ("C1", "C5")],
+    "exp2": [("B4", "B2"), ("B4", "B5"), ("B4", "B3"), ("B4", "B1")],
+    "exp3": [("C1", "C7"), ("C1", "C5"), ("C1", "C2"), ("C1", "C3"), ("C1", "C4"), ("C1", "C6")],
 }
 
 # 排序意义: +1 = 越大越好, -1 = 越小越好.
@@ -299,7 +300,7 @@ def main():
     elif exp in ("exp2", "exp3"):
         metrics = ["system_profit", "coal_profit", "power_profit", "SR", "SR_1",
                    "SR_N", "J", "theta", "lambda1", "g_u", "g_c", "mu_c", "mu_u"]
-        title = ("实验二: 直接互惠机制主实验 (B4 vs B5 为核心)" if exp == "exp2"
+        title = ("实验二: 直接互惠机制主实验 (B4 vs B2 为头条)" if exp == "exp2"
                  else "实验三: 机制来源消融 (b4 变体)")
         print_table(group_table(long, groups, METRIC_COLS), metrics, title,
                     decimals={"system_profit": 1, "coal_profit": 1, "power_profit": 1})
@@ -317,7 +318,7 @@ def main():
     if pairs:
         print_pairs(long, pairs, test_metrics)
     elif exp in ("exp2", "exp3"):
-        print("\n(无可用配对组别; 确认 B2/B4/B5 等都已跑.)")
+        print("\n(无可用配对组别; 确认 B1/B2/B3/B4 等都已跑.)")
 
     if args.csv:
         tbl = group_table(long, groups, METRIC_COLS)

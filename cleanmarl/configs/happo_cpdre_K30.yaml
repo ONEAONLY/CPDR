@@ -24,7 +24,7 @@ env:
   demand_corr: 0.0
   demand_common_pool: false
   demand_vol_scale: []
-  K_capacity: null
+  K_capacity: 3.0
   theta_min: 0.70
   theta_max: 1.20
   theta_init: 1.0
@@ -97,7 +97,7 @@ model:
 
 system:
   device: "cuda"
-  log_dir: "./logs/cleanmarl"
+  log_dir: "./logs/cleanmarl_K30"
   checkpoint_dir: "./checkpoints"
 
 experiment:

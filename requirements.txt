@@ -1,0 +1,13 @@
+# CPDRE / cleanmarl 运行依赖 (2026-06 RTX4060 机器实测版本)
+# cleanmarl 是 PyTorch 原生 (采样+GAE+PPO/HAPPO+GRU+集中critic), 训练/分析不走 RLlib,
+# 故无需 ray/gym。服务器上按本机 CUDA 选 torch 版本即可 (CPU 也能跑)。
+#
+# 环境: Python 3.8.20
+# 安装: pip install -r requirements.txt
+#   (torch 请按服务器 CUDA 版本从 https://pytorch.org 选择对应 wheel; 下面是实测版本)
+
+torch==2.3.1
+numpy==1.24.3
+scipy==1.10.1
+pandas==2.0.3
+PyYAML>=5.4

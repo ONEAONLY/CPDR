@@ -14,6 +14,7 @@ from typing import Dict
 
 from cleanmarl.core.trainer import Trainer
 from cleanmarl.models import GRUActor, CentralizedCritic
+from cleanmarl.algos.value_norm import ValueNorm
 
 
 class HAPPO(Trainer):
@@ -56,6 +57,12 @@ class HAPPO(Trainer):
         self.critic = CentralizedCritic(self.state_dim, self.num_agents, hidden,
                                         rnn_layers=rnn_layers).to(self.device)
 
+        # 价值归一化 (PopArt 式): critic 输出归一化价值, 去掉利润大常数地板,
+        # 让 vf_explained_var 学得起来 (见 value_norm.py / CLAUDE.md). 默认开.
+        self.use_value_norm = bool(config.get('use_value_norm', True))
+        self.value_norm = (ValueNorm(self.num_agents).to(self.device)
+                           if self.use_value_norm else None)
+
         self.actor_opts = [
             torch.optim.Adam(a.parameters(), lr=config.get('actor_lr', 5e-4))
             for a in self.actors
@@ -97,6 +104,8 @@ class HAPPO(Trainer):
                 logps.append(lp)
                 new_h.append(h)
             values, critic_h = self.critic.get_value(state_t, critic_h)
+            if self.value_norm is not None:   # critic 输出归一化值 -> 还原到原始空间供 GAE
+                values = self.value_norm.denormalize(values)
 
             act_np = torch.stack(actions).cpu().numpy()
             next_obs, rewards, done, step_info = self.env.step(act_np)
@@ -147,6 +156,8 @@ class HAPPO(Trainer):
         with torch.no_grad():
             state_t = torch.as_tensor(state, dtype=torch.float32, device=dev)
             last_val, _ = self.critic.get_value(state_t, critic_h)
+            if self.value_norm is not None:
+                last_val = self.value_norm.denormalize(last_val)
         last_val = last_val.cpu().numpy()
 
         self._buf = {
@@ -208,6 +219,11 @@ class HAPPO(Trainer):
         # advantage归一化（全局）
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
+        # 价值归一化: 用本 rollout 的原始 returns 更新 running mean/var,
+        # 之后 critic 在归一化空间回归 (见 _update_critic).
+        if self.value_norm is not None:
+            self.value_norm.update(returns)
+
         m = {'policy_loss': [], 'value_loss': [], 'entropy': [], 'approx_kl': []}
 
         for _ in range(self.num_sgd_iter):
@@ -266,7 +282,11 @@ class HAPPO(Trainer):
         return cur_adv
 
     def _update_critic(self, state, returns, old_val):
-        values, _ = self.critic(state)  # (E, L, N)
+        values, _ = self.critic(state)  # (E, L, N)  价值归一化时这是归一化空间的预测
+        if self.value_norm is not None:
+            # critic 预测 & 目标 & clip 全在归一化空间; returns/old_val 是原始空间需归一化.
+            returns = self.value_norm.normalize(returns)
+            old_val = self.value_norm.normalize(old_val)
         v_clipped = old_val + torch.clamp(values - old_val, -self.value_clip, self.value_clip)
         vl1 = (values - returns).pow(2)
         vl2 = (v_clipped - returns).pow(2)
@@ -281,6 +301,8 @@ class HAPPO(Trainer):
     def _final_metrics(self, state, returns):
         with torch.no_grad():
             values, _ = self.critic(state)  # (E,L,N)
+            if self.value_norm is not None:  # 还原到原始空间再与原始 returns 比 EV
+                values = self.value_norm.denormalize(values)
         out = {}
         for i in range(self.num_agents):
             y_true = returns[:, :, i].reshape(-1)

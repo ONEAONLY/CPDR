@@ -18,6 +18,7 @@ env:
   demand_peak: 1.4
   demand_season_amp: 0.40      # a_D 旺淡落差 (0626 平台季节)
   demand_season_phi: 13        # phi_D 旺季起始周
+  nonstationary_season: true
   peak_weeks: 26               # W_on 旺季周数 (可改非对称, 如 18)
   demand_sigma: 0.15
   demand_ar1_rho: 0.60
@@ -97,7 +98,7 @@ model:
 
 system:
   device: "cuda"
-  log_dir: "./logs/cleanmarl"
+  log_dir: "./logs/cleanmarl_nonstat"
   checkpoint_dir: "./checkpoints"
 
 experiment:
